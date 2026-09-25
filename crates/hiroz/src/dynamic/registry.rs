@@ -126,8 +126,8 @@ pub fn parsed_message_to_schema(
 /// `example_interfaces/srv/AddTwoInts_Request`, which cannot be inferred from
 /// a standalone [`hiroz_codegen::types::ParsedMessage`]. Nested types in the
 /// `.msg`, `.srv`, and `.action` source formats belong to the parent's package
-/// `msg` namespace. Use [`parsed_idl_message_to_schema`] for IDL references,
-/// which retain their declared interface namespace.
+/// `msg` namespace. Use [`parsed_message_to_schema_named_with_references`] when
+/// the source format retains a different namespace for individual fields.
 #[cfg(feature = "dynamic-schema-loader")]
 pub fn parsed_message_to_schema_named(
     msg: &hiroz_codegen::types::ParsedMessage,
@@ -137,8 +137,10 @@ pub fn parsed_message_to_schema_named(
     parsed_message_to_schema_named_with_references(msg, type_name, resolver, &|_| None)
 }
 
+/// Convert a parsed message while resolving each non-primitive field through
+/// an optional canonical ROS type name supplied by the source-format adapter.
 #[cfg(feature = "dynamic-schema-loader")]
-fn parsed_message_to_schema_named_with_references<'a>(
+pub fn parsed_message_to_schema_named_with_references<'a>(
     msg: &hiroz_codegen::types::ParsedMessage,
     type_name: &str,
     resolver: &impl Fn(&str) -> Option<Arc<MessageSchema>>,
@@ -388,33 +390,6 @@ fn schema_named(
         .find(|schema| schema.type_name == type_name)
         .cloned()
         .ok_or_else(|| DynamicError::SchemaNotFound(type_name.to_string()))
-}
-
-/// Convert every struct from a parsed ROS IDL file.
-#[cfg(feature = "dynamic-schema-loader")]
-pub fn parsed_idl_to_schemas(
-    idl: &hiroz_codegen::parser::idl::ParsedIdl,
-    resolver: &impl Fn(&str) -> Option<Arc<MessageSchema>>,
-) -> Result<Vec<Arc<MessageSchema>>, DynamicError> {
-    idl.messages
-        .iter()
-        .map(|message| parsed_idl_message_to_schema(idl, message, resolver))
-        .collect()
-}
-
-/// Convert one struct from a parsed ROS IDL file.
-#[cfg(feature = "dynamic-schema-loader")]
-pub fn parsed_idl_message_to_schema(
-    idl: &hiroz_codegen::parser::idl::ParsedIdl,
-    message: &hiroz_codegen::parser::idl::ParsedIdlMessage,
-    resolver: &impl Fn(&str) -> Option<Arc<MessageSchema>>,
-) -> Result<Arc<MessageSchema>, DynamicError> {
-    parsed_message_to_schema_named_with_references(
-        &message.message,
-        &format!("{}/{}/{}", idl.package, idl.kind, message.message.name),
-        resolver,
-        &|field| message.references.get(field).map(String::as_str),
-    )
 }
 
 #[cfg(feature = "dynamic-schema-loader")]
@@ -925,53 +900,45 @@ mod embedded_tests {
     }
 
     #[test]
-    fn idl_native_char_is_distinct_from_legacy_msg_char() {
-        let parsed = hiroz_codegen::parser::idl::parse_idl_string(
-            "module demo_interfaces { module msg { struct Native { char code; octet raw; }; }; };",
-            std::path::Path::new("Native.idl"),
-        )
-        .unwrap();
-        let schema = parsed_idl_to_schemas(&parsed, &|_| None)
-            .unwrap()
-            .pop()
-            .unwrap();
+    fn reference_aware_conversion_retains_explicit_namespaces() {
+        use hiroz_codegen::types::{ArrayType, Field, FieldType as ParsedFieldType, ParsedMessage};
 
-        assert!(matches!(
-            schema.field("code").unwrap().field_type,
-            FieldType::Char
-        ));
-        assert!(matches!(
-            schema.field("raw").unwrap().field_type,
-            FieldType::Byte
-        ));
-        let description =
-            crate::dynamic::MessageSchemaTypeDescription::to_type_description(schema.as_ref())
-                .unwrap();
-        assert_eq!(
-            description.fields[0].field_type.type_id,
-            hiroz_schema::TypeId::CHAR
-        );
-    }
-
-    #[test]
-    fn idl_conversion_retains_local_and_cross_namespace_references() {
-        let parsed = hiroz_codegen::parser::idl::parse_idl_string(
-            "module demo_interfaces { module action { \
-               struct Count_Goal { long order; }; \
-               struct Count_SendGoal_Request { \
-                 Count_Goal goal; \
-                 demo_interfaces::srv::Control_Request control; \
-               }; \
-             }; };",
-            std::path::Path::new("Count.idl"),
-        )
-        .unwrap();
-        let goal = parsed
-            .messages
-            .iter()
-            .find(|message| message.message.name == "Count_Goal")
-            .unwrap();
-        let goal = parsed_idl_message_to_schema(&parsed, goal, &|_| None).unwrap();
+        let parsed = ParsedMessage {
+            name: "Count_SendGoal_Request".to_string(),
+            package: "demo_interfaces".to_string(),
+            fields: vec![
+                Field {
+                    name: "goal".to_string(),
+                    field_type: ParsedFieldType {
+                        base_type: "Count_Goal".to_string(),
+                        package: None,
+                        array: ArrayType::Single,
+                        string_bound: None,
+                    },
+                    default: None,
+                },
+                Field {
+                    name: "control".to_string(),
+                    field_type: ParsedFieldType {
+                        base_type: "Control_Request".to_string(),
+                        package: Some("demo_interfaces".to_string()),
+                        array: ArrayType::Single,
+                        string_bound: None,
+                    },
+                    default: None,
+                },
+            ],
+            constants: Vec::new(),
+            source: String::new(),
+            path: std::path::PathBuf::new(),
+        };
+        let goal = Arc::new(MessageSchema {
+            type_name: "demo_interfaces/action/Count_Goal".to_string(),
+            package: "demo_interfaces".to_string(),
+            name: "Count_Goal".to_string(),
+            fields: Vec::new(),
+            type_hash: None,
+        });
         let control = Arc::new(MessageSchema {
             type_name: "demo_interfaces/srv/Control_Request".to_string(),
             package: "demo_interfaces".to_string(),
@@ -979,18 +946,21 @@ mod embedded_tests {
             fields: Vec::new(),
             type_hash: None,
         });
-        let request = parsed
-            .messages
-            .iter()
-            .find(|message| message.message.name == "Count_SendGoal_Request")
-            .unwrap();
-        let request =
-            parsed_idl_message_to_schema(&parsed, request, &|canonical| match canonical {
+        let request = parsed_message_to_schema_named_with_references(
+            &parsed,
+            "demo_interfaces/action/Count_SendGoal_Request",
+            &|canonical| match canonical {
                 "demo_interfaces/action/Count_Goal" => Some(goal.clone()),
                 "demo_interfaces/srv/Control_Request" => Some(control.clone()),
                 _ => None,
-            })
-            .unwrap();
+            },
+            &|field| match field {
+                "goal" => Some("demo_interfaces/action/Count_Goal"),
+                "control" => Some("demo_interfaces/srv/Control_Request"),
+                _ => None,
+            },
+        )
+        .unwrap();
 
         assert!(matches!(
             &request.field("goal").unwrap().field_type,

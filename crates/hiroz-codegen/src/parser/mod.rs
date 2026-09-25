@@ -1,6 +1,4 @@
 pub mod action;
-#[cfg(feature = "idl")]
-pub mod idl;
 pub mod msg;
 pub mod srv;
 
